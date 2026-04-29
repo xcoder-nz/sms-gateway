@@ -18,12 +18,17 @@ from app.schemas.sms import InboundSMSRequest
 from app.services.audit_service import log_event
 from app.services.command_parser import parse_command
 
-pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
-adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
 
+app.include_router(health_router)
+app.include_router(sms_router)
+app.include_router(users_router)
+app.include_router(wallets_router)
+app.include_router(transactions_router)
+app.include_router(merchants_router)
+app.include_router(network_router)
 
 def _digits_only(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
@@ -74,9 +79,6 @@ def inbound(payload: InboundSMSRequest, db: Session = Depends(get_db)):
     log_event(db, "sms_command", cmd)
     return execute_command(msg.from_number, cmd, db)
 
-@app.get("/api/sms/logs")
-def sms_logs(db: Session = Depends(get_db)):
-    return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
 
 
 def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id: int | None = None):
