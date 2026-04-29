@@ -48,6 +48,18 @@ def inbound(payload: dict, db: Session = Depends(get_db)):
     log_event(db, "sms_command", cmd)
     return execute_command(msg.from_number, cmd, db)
 
+
+@app.post("/api/transactions/pay")
+def pay_transaction(payload: dict, db: Session = Depends(get_db)):
+    cmd = {
+        "cmd": "PAY",
+        "merchant_phone": payload["merchant_phone"],
+        "amount": int(payload["amount"]),
+        "pin": payload["pin"],
+    }
+    log_event(db, "api_pay_request", {"from_number": payload["from_number"], **cmd})
+    return execute_command(payload["from_number"], cmd, db)
+
 @app.get("/api/sms/logs")
 def sms_logs(db: Session = Depends(get_db)):
     return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
