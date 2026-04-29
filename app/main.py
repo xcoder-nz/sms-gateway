@@ -191,6 +191,18 @@ def inbound(payload: dict, request: Request, db: Session = Depends(get_db)):
     return execute_command(msg.from_number, cmd, db, correlation_id=correlation_id, request_id=request_id, sms_ref=msg.provider_message_id)
 
 
+
+@app.post("/api/transactions/pay")
+def pay_transaction(payload: dict, db: Session = Depends(get_db)):
+    cmd = {
+        "cmd": "PAY",
+        "merchant_phone": payload["merchant_phone"],
+        "amount": int(payload["amount"]),
+        "pin": payload["pin"],
+    }
+    log_event(db, "api_pay_request", {"from_number": payload["from_number"], **cmd})
+    return execute_command(payload["from_number"], cmd, db)
+
 @app.get("/api/sms/logs")
 def sms_logs(db: Session = Depends(get_db), _: User = Depends(require_admin)):
     return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
