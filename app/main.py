@@ -1,8 +1,13 @@
 from decimal import Decimal
+import logging
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
@@ -11,6 +16,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
+from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.schemas.api_responses import ErrorDetail
@@ -20,6 +26,11 @@ from app.services.command_parser import parse_command
 
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
+adapter = MockSMSAdapter()
+logger = logging.getLogger("sms_gateway")
+admin_auth_scheme = HTTPBearer(auto_error=False)
+inbound_rate_limit_windows = defaultdict(deque)
+pin_attempts = defaultdict(lambda: {"count": 0, "lockout_until": None})
 Base.metadata.create_all(bind=engine)
 
 app.include_router(health_router)
@@ -121,7 +132,7 @@ def mobile_demo(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("mobile_demo.html", {"request": request, "users": users, "sms": sms})
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin(request: Request, db: Session = Depends(get_db)):
+def admin(request: Request, db: Session = Depends(get_db), _: User = Depends(require_admin)):
     total_float = db.query(func.coalesce(func.sum(Wallet.balance), 0)).scalar()
     txns = db.query(Transaction).order_by(Transaction.id.desc()).limit(20).all()
     wallets = db.query(Wallet).all()
@@ -129,7 +140,9 @@ def admin(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 @app.post("/api/sms/inbound")
-def inbound(payload: dict, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"), db: Session = Depends(get_db)):
+def inbound(payload: dict, db: Session = Depends(get_db)):
+    from_number = payload.get("from_number", "unknown")
+    enforce_inbound_rate_limit(from_number)
     msg = adapter.normalize_inbound(payload)
     inbound_key = idempotency_key or payload.get("idempotency_key")
     if inbound_key:
@@ -145,25 +158,57 @@ def inbound(payload: dict, idempotency_key: str | None = Header(default=None, al
     log_event(db, "sms_command", cmd)
     return execute_command(msg.from_number, cmd, db)
 
+@app.get("/api/sms/logs")
+def sms_logs(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
 
-@app.post("/api/transactions/pay")
-def api_pay(payload: dict, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"), db: Session = Depends(get_db)):
-    payer_phone = payload.get("payer_phone")
-    merchant_phone = payload.get("merchant_phone")
-    pin = payload.get("pin")
-    amount = _to_decimal(payload.get("amount"))
 
-    payer = db.query(User).filter(User.phone_number == payer_phone, User.status == "active").first()
-    merchant = db.query(User).filter(User.phone_number == merchant_phone, User.role == "merchant", User.status == "active").first()
-    if not payer or not merchant:
-        raise HTTPException(404, "User not found")
-    if not pwd.verify(pin, payer.pin_hash):
-        raise HTTPException(400, "Invalid PIN")
+def require_admin(
+    credentials: HTTPAuthorizationCredentials | None = Depends(admin_auth_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    if not settings.admin_api_token:
+        logger.error("admin_auth_not_configured")
+        raise HTTPException(503, "Service temporarily unavailable")
+    if not credentials or credentials.scheme.lower() != "bearer" or credentials.credentials != settings.admin_api_token:
+        logger.info("admin_auth_failed")
+        raise HTTPException(401, "Authentication required")
+    admin_user = db.query(User).filter(User.role == "admin", User.status == "active").first()
+    if not admin_user:
+        logger.warning("admin_user_not_found")
+        raise HTTPException(403, "Not authorized")
+    return admin_user
 
-    operation_key = idempotency_key or payload.get("idempotency_key")
-    tx = _process_payment(db, payer, merchant, amount, operation_key)
-    return {"ok": True, "transaction_reference": tx.reference, "status": tx.status}
 
+def enforce_inbound_rate_limit(phone_number: str):
+    now = datetime.now(timezone.utc)
+    window = inbound_rate_limit_windows[phone_number]
+    cutoff = now - timedelta(seconds=settings.inbound_rate_limit_window_seconds)
+    while window and window[0] < cutoff:
+        window.popleft()
+    if len(window) >= settings.inbound_rate_limit_count:
+        logger.warning("inbound_rate_limit_exceeded", extra={"phone": phone_number})
+        raise HTTPException(429, "Too many requests")
+    window.append(now)
+
+
+def enforce_pin_lockout(phone_number: str):
+    attempt_state = pin_attempts[phone_number]
+    lockout_until = attempt_state.get("lockout_until")
+    if lockout_until and datetime.now(timezone.utc) < lockout_until:
+        raise HTTPException(429, "Too many requests")
+
+
+def record_failed_pin_attempt(phone_number: str):
+    attempt_state = pin_attempts[phone_number]
+    attempt_state["count"] += 1
+    if attempt_state["count"] >= settings.pin_max_attempts:
+        attempt_state["lockout_until"] = datetime.now(timezone.utc) + timedelta(seconds=settings.pin_lockout_seconds)
+        attempt_state["count"] = 0
+
+
+def clear_pin_attempts(phone_number: str):
+    pin_attempts[phone_number] = {"count": 0, "lockout_until": None}
 
 
 def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id: int | None = None):
@@ -188,8 +233,11 @@ def execute_command(sender: str, cmd: dict, db: Session):
             db.add(tx)
         return {"ok": True}
     if cmd["cmd"] == "PAY":
+        enforce_pin_lockout(sender)
         if not pwd.verify(cmd["pin"], user.pin_hash):
-            raise HTTPException(400, "Invalid PIN")
+            record_failed_pin_attempt(sender)
+            raise HTTPException(400, "Invalid request")
+        clear_pin_attempts(sender)
         merch = db.query(User).filter(User.phone_number == cmd["merchant_phone"], User.role == "merchant", User.status == "active").first()
         if not merch:
             raise HTTPException(404, "Merchant not found")
@@ -199,3 +247,26 @@ def execute_command(sender: str, cmd: dict, db: Session):
         send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id)
         return {"ok": True, "transaction_reference": tx.reference}
     return {"ok": True, "note": "Command accepted"}
+
+
+@app.exception_handler(HTTPException)
+def handle_http_exception(_: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        logger.error("http_exception", extra={"status_code": exc.status_code, "detail": exc.detail})
+        return JSONResponse(status_code=exc.status_code, content={"ok": False, "message": "Service temporarily unavailable"})
+    safe_messages = {
+        400: "Invalid request",
+        401: "Authentication required",
+        403: "Not authorized",
+        404: "Resource not found",
+        429: "Too many requests",
+    }
+    message = safe_messages.get(exc.status_code, "Request failed")
+    logger.info("request_rejected", extra={"status_code": exc.status_code, "detail": exc.detail})
+    return JSONResponse(status_code=exc.status_code, content={"ok": False, "message": message})
+
+
+@app.exception_handler(RequestValidationError)
+def handle_validation_exception(_: Request, exc: RequestValidationError):
+    logger.info("validation_failed", extra={"errors": exc.errors()})
+    return JSONResponse(status_code=400, content={"ok": False, "message": "Invalid request"})
