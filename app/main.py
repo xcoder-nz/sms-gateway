@@ -6,7 +6,14 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.adapters.sms.mock import MockSMSAdapter
+from app.adapters.factory import (
+    AdapterConfigError,
+    get_bank_adapter,
+    get_sms_adapter,
+    validate_adapter_configuration,
+)
+from app.adapters.sms.base import SMSAdapter
+from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import log_event
@@ -17,13 +24,31 @@ from app.services.wallet_service import WalletService
 
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
-adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
 
 
+@app.on_event("startup")
+def validate_adapters_on_startup():
+    try:
+        validate_adapter_configuration()
+    except AdapterConfigError as exc:
+        raise RuntimeError(f"Adapter configuration error: {exc}") from exc
+
+
 @app.get("/health")
-def health():
-    return {"ok": True, "mode": "DEMO/SIMULATED"}
+def health(
+    sms_adapter: SMSAdapter = Depends(get_sms_adapter),
+    bank_adapter=Depends(get_bank_adapter),
+):
+    sms_health = sms_adapter.healthcheck()
+    return {
+        "ok": True,
+        "mode": "DEMO/SIMULATED",
+        "adapters": {
+            "sms": {"name": settings.sms_adapter, "health": sms_health},
+            "bank": {"name": settings.bank_adapter, "status": "configured"},
+        },
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def mobile_demo(request: Request, db: Session = Depends(get_db)):
@@ -40,13 +65,17 @@ def admin(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 @app.post("/api/sms/inbound")
-def inbound(payload: dict, db: Session = Depends(get_db)):
-    msg = adapter.normalize_inbound(payload)
+def inbound(
+    payload: dict,
+    db: Session = Depends(get_db),
+    sms_adapter: SMSAdapter = Depends(get_sms_adapter),
+):
+    msg = sms_adapter.normalize_inbound(payload)
     db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
     db.commit()
     cmd = parse_command(msg.body)
     log_event(db, "sms_command", cmd)
-    return execute_command(msg.from_number, cmd, db)
+    return execute_command(msg.from_number, cmd, db, sms_adapter)
 
 @app.get("/api/sms/logs")
 def sms_logs(db: Session = Depends(get_db)):
@@ -54,7 +83,7 @@ def sms_logs(db: Session = Depends(get_db)):
 
 
 
-def execute_command(sender: str, cmd: dict, db: Session):
+def execute_command(sender: str, cmd: dict, db: Session, sms_adapter: SMSAdapter):
     user = db.query(User).filter(User.phone_number == sender).first()
     notifier = NotificationService(db, adapter)
     wallet_service = WalletService(db)
