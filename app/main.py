@@ -1,10 +1,8 @@
 from decimal import Decimal
-from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from passlib.context import CryptContext
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -17,11 +15,13 @@ from app.adapters.factory import (
 from app.adapters.sms.base import SMSAdapter
 from app.config import settings
 from app.db import Base, engine, get_db
-from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
+from app.models import SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import log_event
 from app.services.command_parser import parse_command
+from app.services.notification_service import NotificationService
+from app.services.transaction_service import TransactionService
+from app.services.wallet_service import WalletService
 
-pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
 Base.metadata.create_all(bind=engine)
@@ -82,47 +82,55 @@ def sms_logs(db: Session = Depends(get_db)):
     return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
 
 
-def send_outbound(
-    db: Session,
-    to_number: str,
-    body: str,
-    linked_transaction_id: int | None = None,
-    sms_adapter: SMSAdapter | None = None,
-):
-    sms_adapter = sms_adapter or get_sms_adapter()
-    result = sms_adapter.send_sms(to_number, body)
-    db.add(SMSMessage(direction="outbound", from_number="DEMO-SWITCH", to_number=to_number, body=body, provider_message_id=result.provider_message_id, delivery_status=result.delivery_status, linked_transaction_id=linked_transaction_id))
-    db.commit()
-
 
 def execute_command(sender: str, cmd: dict, db: Session, sms_adapter: SMSAdapter):
     user = db.query(User).filter(User.phone_number == sender).first()
+    notifier = NotificationService(db, adapter)
+    wallet_service = WalletService(db)
+    tx_service = TransactionService(db)
+
     if cmd["cmd"] == "HELP":
-        send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>", sms_adapter=sms_adapter)
+        notifier.send_sms(sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>")
         return {"ok": True}
+
     if not user or user.status != "active":
         raise HTTPException(404, "Sender not active")
+
     if cmd["cmd"] == "BAL":
-        w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
-        send_outbound(db, sender, f"DEMO BALANCE: {w.balance} {w.currency}", sms_adapter=sms_adapter)
-        tx = Transaction(reference=str(uuid4())[:12], type="balance_inquiry", from_user_id=user.id, amount=0, currency="AFN", status="completed")
-        db.add(tx); db.commit()
+        balance_result = wallet_service.get_user_balance(user)
+        notifier.send_sms(sender, f"DEMO BALANCE: {balance_result.balance} {balance_result.currency}")
+        tx_service.create_balance_inquiry(user)
         return {"ok": True}
+
     if cmd["cmd"] == "PAY":
-        if not pwd.verify(cmd["pin"], user.pin_hash):
-            raise HTTPException(400, "Invalid PIN")
-        merch = db.query(User).filter(User.phone_number == cmd["merchant_phone"], User.role == "merchant", User.status == "active").first()
-        if not merch:
-            raise HTTPException(404, "Merchant not found")
-        buyer_w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
-        merch_w = db.query(Wallet).filter(Wallet.user_id == merch.id).first()
-        amount = Decimal(cmd["amount"])
-        if amount <= 0 or buyer_w.balance < amount:
-            raise HTTPException(400, "Insufficient balance")
-        buyer_w.balance -= amount; merch_w.balance += amount
-        tx = Transaction(reference=str(uuid4())[:12], type="payment", from_user_id=user.id, to_user_id=merch.id, merchant_id=merch.id, amount=amount, currency="AFN", status="completed")
-        db.add(tx); db.commit(); db.refresh(tx)
-        send_outbound(db, sender, f"DEMO RECEIPT: Paid {amount} AFN to {merch.full_name}", tx.id, sms_adapter=sms_adapter)
-        send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id, sms_adapter=sms_adapter)
-        return {"ok": True, "transaction_reference": tx.reference}
+        pay_result = tx_service.pay(
+            buyer=user,
+            merchant_phone=cmd["merchant_phone"],
+            amount=Decimal(cmd["amount"]),
+            pin=cmd["pin"],
+        )
+        if pay_result.status == "rejected":
+            error_map = {
+                "invalid_pin": (400, "Invalid PIN"),
+                "merchant_not_found": (404, "Merchant not found"),
+                "wallet_not_found": (404, "Wallet not found"),
+                "invalid_amount": (400, "Invalid amount"),
+                "insufficient_balance": (400, "Insufficient balance"),
+            }
+            status_code, detail = error_map.get(pay_result.reason, (400, "Payment rejected"))
+            raise HTTPException(status_code, detail)
+
+        merchant = db.query(User).filter(User.phone_number == cmd["merchant_phone"]).first()
+        notifier.send_sms(sender, f"DEMO RECEIPT: Paid {pay_result.amount} AFN to {merchant.full_name}", pay_result.transaction_id)
+        notifier.send_sms(merchant.phone_number, f"DEMO RECEIPT: Received {pay_result.amount} AFN from {user.full_name}", pay_result.transaction_id)
+        return {"ok": True, "transaction_reference": pay_result.reference}
+
+    if cmd["cmd"] == "CASHIN":
+        result = tx_service.cashin(user, cmd["buyer_phone"], Decimal(cmd["amount"]))
+        return {"ok": True, "status": result.status, "reason": result.reason, "transaction_reference": result.reference}
+
+    if cmd["cmd"] == "CASHOUT":
+        result = tx_service.cashout(user, cmd["buyer_phone"], Decimal(cmd["amount"]))
+        return {"ok": True, "status": result.status, "reason": result.reason, "transaction_reference": result.reference}
+
     return {"ok": True, "note": "Command accepted"}
