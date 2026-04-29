@@ -7,9 +7,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
@@ -25,6 +24,7 @@ from app.services.audit_service import audit_command_decision, audit_state_chang
 from app.services.command_parser import parse_command
 
 app = FastAPI(title="SMS Wallet Demo")
+app.mount("/static", StaticFiles(directory="app/ui/static"), name="static")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
 logger = logging.getLogger("sms_gateway")
@@ -151,6 +151,18 @@ def admin(request: Request, db: Session = Depends(get_db), _: User = Depends(req
     sms = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(20).all()
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
+
+
+@app.get("/api/feed/sms")
+def feed_sms(db: Session = Depends(get_db)):
+    rows = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(40).all()
+    return [{"id": s.id, "direction": s.direction, "body": s.body, "created_at": s.created_at.isoformat() if s.created_at else None} for s in rows]
+
+
+@app.get("/api/feed/transactions")
+def feed_transactions(db: Session = Depends(get_db)):
+    rows = db.query(Transaction).order_by(Transaction.id.desc()).limit(40).all()
+    return [{"id": t.id, "reference": t.reference, "type": t.type, "amount": str(t.amount), "currency": t.currency, "status": t.status, "created_at": t.created_at.isoformat() if t.created_at else None} for t in rows]
 
 @app.post("/api/sms/inbound")
 def inbound(payload: dict, request: Request, db: Session = Depends(get_db)):

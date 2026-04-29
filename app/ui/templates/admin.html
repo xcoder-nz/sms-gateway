@@ -1,1 +1,46 @@
-<!doctype html><html><body><h1>Admin Dashboard (DEMO/SIMULATED)</h1><p>Total wallet float: {{total_float}}</p><h2>Transactions</h2><ul>{% for t in txns %}<li>{{t.reference}} {{t.type}} {{t.amount}} {{t.status}}</li>{% endfor %}</ul><h2>SMS</h2><ul>{% for s in sms %}<li>{{s.direction}} {{s.body}}</li>{% endfor %}</ul></body></html>
+<!doctype html>
+<html>
+<head>
+  <title>Admin Dashboard</title>
+  <link rel="stylesheet" href="/static/demo.css" />
+</head>
+<body>
+<div class="container">
+  <h1>Admin Dashboard <span class="badge demo">DEMO</span> <span class="badge sim">SIMULATED</span></h1>
+
+  <div class="grid">
+    <section class="card">
+      <h3>Summary Cards</h3>
+      <p>Total Wallet Float: <b>{{total_float}}</b> <span class="badge demo">DEMO</span></p>
+      <p>Wallets: <b>{{wallets|length}}</b></p>
+      <div id="txn-detail" class="small">Transaction detail view (DEMO/SIMULATED).</div>
+    </section>
+
+    <section class="card">
+      <h3>Payment Network Visualization <span class="badge sim">SIMULATED</span></h3>
+      <div class="route">
+        <span class="node" id="route-buyer">Buyer</span><span class="edge">→</span>
+        <span class="node" id="route-demo-switch">DemoSwitch (latest route highlight)</span><span class="edge">→</span>
+        <span class="node" id="route-merchant">Merchant</span>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid" style="margin-top:16px;">
+    <section class="card">
+      <h3>Transaction Table <span class="badge demo">DEMO</span></h3>
+      <table><thead><tr><th>Ref</th><th>Type</th><th>Amount</th><th>Status</th><th>Time</th></tr></thead>
+        <tbody id="txn-rows"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h3>SMS Feed <span class="badge sim">SIMULATED</span></h3>
+      <table><thead><tr><th>ID</th><th>Dir</th><th>Body</th><th>Time</th></tr></thead>
+        <tbody id="sms-history"></tbody>
+      </table>
+    </section>
+  </div>
+</div>
+<script src="/static/demo.js"></script>
+</body>
+</html>
