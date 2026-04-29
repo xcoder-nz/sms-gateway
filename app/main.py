@@ -13,16 +13,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import audit_command_decision, audit_state_change, log_event
 from app.services.command_parser import parse_command
 from app.config import settings
+from app.seed.demo_seed import seed_for_session
 
 app = FastAPI(title="SMS Wallet Demo")
 app.mount("/static", StaticFiles(directory="app/ui/static"), name="static")
@@ -48,6 +49,18 @@ def enforce_pin_lockout(sender: str):
 def require_admin():
     # Demo placeholder until real auth is wired in
     return None
+
+
+
+@app.on_event("startup")
+def seed_demo_users_on_startup():
+    db = SessionLocal()
+    try:
+        seed_for_session(db)
+    except (OperationalError, ProgrammingError):
+        logger.warning("Skipping demo seed during startup because database is not initialized yet")
+    finally:
+        db.close()
 
 
 
