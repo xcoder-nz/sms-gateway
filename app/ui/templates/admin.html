@@ -1,0 +1,1 @@
+<!doctype html><html><body><h1>Admin Dashboard (DEMO/SIMULATED)</h1><p>Total wallet float: {{total_float}}</p><h2>Transactions</h2><ul>{% for t in txns %}<li>{{t.reference}} {{t.type}} {{t.amount}} {{t.status}}</li>{% endfor %}</ul><h2>SMS</h2><ul>{% for s in sms %}<li>{{s.direction}} {{s.body}}</li>{% endfor %}</ul></body></html>
