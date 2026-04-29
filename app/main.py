@@ -8,7 +8,14 @@ from passlib.context import CryptContext
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.adapters.sms.mock import MockSMSAdapter
+from app.adapters.factory import (
+    AdapterConfigError,
+    get_bank_adapter,
+    get_sms_adapter,
+    validate_adapter_configuration,
+)
+from app.adapters.sms.base import SMSAdapter
+from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import log_event
@@ -17,13 +24,31 @@ from app.services.command_parser import parse_command
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
-adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
 
 
+@app.on_event("startup")
+def validate_adapters_on_startup():
+    try:
+        validate_adapter_configuration()
+    except AdapterConfigError as exc:
+        raise RuntimeError(f"Adapter configuration error: {exc}") from exc
+
+
 @app.get("/health")
-def health():
-    return {"ok": True, "mode": "DEMO/SIMULATED"}
+def health(
+    sms_adapter: SMSAdapter = Depends(get_sms_adapter),
+    bank_adapter=Depends(get_bank_adapter),
+):
+    sms_health = sms_adapter.healthcheck()
+    return {
+        "ok": True,
+        "mode": "DEMO/SIMULATED",
+        "adapters": {
+            "sms": {"name": settings.sms_adapter, "health": sms_health},
+            "bank": {"name": settings.bank_adapter, "status": "configured"},
+        },
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def mobile_demo(request: Request, db: Session = Depends(get_db)):
@@ -40,35 +65,46 @@ def admin(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 @app.post("/api/sms/inbound")
-def inbound(payload: dict, db: Session = Depends(get_db)):
-    msg = adapter.normalize_inbound(payload)
+def inbound(
+    payload: dict,
+    db: Session = Depends(get_db),
+    sms_adapter: SMSAdapter = Depends(get_sms_adapter),
+):
+    msg = sms_adapter.normalize_inbound(payload)
     db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
     db.commit()
     cmd = parse_command(msg.body)
     log_event(db, "sms_command", cmd)
-    return execute_command(msg.from_number, cmd, db)
+    return execute_command(msg.from_number, cmd, db, sms_adapter)
 
 @app.get("/api/sms/logs")
 def sms_logs(db: Session = Depends(get_db)):
     return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
 
 
-def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id: int | None = None):
-    result = adapter.send_sms(to_number, body)
+def send_outbound(
+    db: Session,
+    to_number: str,
+    body: str,
+    linked_transaction_id: int | None = None,
+    sms_adapter: SMSAdapter | None = None,
+):
+    sms_adapter = sms_adapter or get_sms_adapter()
+    result = sms_adapter.send_sms(to_number, body)
     db.add(SMSMessage(direction="outbound", from_number="DEMO-SWITCH", to_number=to_number, body=body, provider_message_id=result.provider_message_id, delivery_status=result.delivery_status, linked_transaction_id=linked_transaction_id))
     db.commit()
 
 
-def execute_command(sender: str, cmd: dict, db: Session):
+def execute_command(sender: str, cmd: dict, db: Session, sms_adapter: SMSAdapter):
     user = db.query(User).filter(User.phone_number == sender).first()
     if cmd["cmd"] == "HELP":
-        send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>")
+        send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>", sms_adapter=sms_adapter)
         return {"ok": True}
     if not user or user.status != "active":
         raise HTTPException(404, "Sender not active")
     if cmd["cmd"] == "BAL":
         w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
-        send_outbound(db, sender, f"DEMO BALANCE: {w.balance} {w.currency}")
+        send_outbound(db, sender, f"DEMO BALANCE: {w.balance} {w.currency}", sms_adapter=sms_adapter)
         tx = Transaction(reference=str(uuid4())[:12], type="balance_inquiry", from_user_id=user.id, amount=0, currency="AFN", status="completed")
         db.add(tx); db.commit()
         return {"ok": True}
@@ -86,7 +122,7 @@ def execute_command(sender: str, cmd: dict, db: Session):
         buyer_w.balance -= amount; merch_w.balance += amount
         tx = Transaction(reference=str(uuid4())[:12], type="payment", from_user_id=user.id, to_user_id=merch.id, merchant_id=merch.id, amount=amount, currency="AFN", status="completed")
         db.add(tx); db.commit(); db.refresh(tx)
-        send_outbound(db, sender, f"DEMO RECEIPT: Paid {amount} AFN to {merch.full_name}", tx.id)
-        send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id)
+        send_outbound(db, sender, f"DEMO RECEIPT: Paid {amount} AFN to {merch.full_name}", tx.id, sms_adapter=sms_adapter)
+        send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id, sms_adapter=sms_adapter)
         return {"ok": True, "transaction_reference": tx.reference}
     return {"ok": True, "note": "Command accepted"}
