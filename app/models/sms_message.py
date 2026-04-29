@@ -12,6 +12,7 @@ class SMSMessage(Base):
     to_number = Column(String, nullable=False)
     body = Column(Text, nullable=False)
     provider_message_id = Column(String, nullable=True)
+    idempotency_key = Column(String, unique=True, nullable=True)
     delivery_status = Column(String, default="queued", nullable=False)
     linked_transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

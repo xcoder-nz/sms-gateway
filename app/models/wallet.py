@@ -11,4 +11,7 @@ class Wallet(Base):
     currency = Column(String, default="AFN", nullable=False)
     balance = Column(Numeric(14, 2), default=0, nullable=False)
     wallet_status = Column(String, default="active", nullable=False)
+    version = Column(Integer, default=1, nullable=False)
     last_updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __mapper_args__ = {"version_id_col": version}
