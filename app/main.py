@@ -8,21 +8,22 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import audit_command_decision, audit_state_change, log_event
 from app.services.command_parser import parse_command
 from app.config import settings
+from app.seed.demo_seed import seed_for_session
 
 app = FastAPI(title="SMS Wallet Demo")
 app.mount("/static", StaticFiles(directory="app/ui/static"), name="static")
@@ -51,6 +52,18 @@ def require_admin():
 
 
 
+@app.on_event("startup")
+def seed_demo_users_on_startup():
+    db = SessionLocal()
+    try:
+        seed_for_session(db)
+    except (OperationalError, ProgrammingError):
+        logger.warning("Skipping demo seed during startup because database is not initialized yet")
+    finally:
+        db.close()
+
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "mode": settings.app_env, "adapter": settings.sms_adapter}
@@ -64,7 +77,7 @@ def mobile_demo(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin(request: Request, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def admin(request: Request, db: Session = Depends(get_db)):
     total_float = db.query(func.coalesce(func.sum(Wallet.balance), 0)).scalar()
     txns = db.query(Transaction).order_by(Transaction.id.desc()).limit(20).all()
     wallets = db.query(Wallet).all()
@@ -73,10 +86,42 @@ def admin(request: Request, db: Session = Depends(get_db), _: User = Depends(req
 
 
 
+@app.post("/admin/buyers")
+def create_buyer(payload: dict, db: Session = Depends(get_db)):
+    full_name = str(payload.get("full_name", "")).strip()
+    phone_number = str(payload.get("phone_number", "")).strip()
+    pin = str(payload.get("pin", "1234")).strip()
+    opening_balance = int(payload.get("opening_balance", 0))
+
+    if not full_name or not phone_number or not pin:
+        raise HTTPException(400, "full_name, phone_number and pin are required")
+
+    buyer = User(
+        full_name=full_name,
+        phone_number=phone_number,
+        national_id=f"N-{phone_number}",
+        pin_hash=pwd.hash(pin),
+        role="buyer",
+        status="active",
+    )
+    db.add(buyer)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "Buyer phone already exists")
+
+    db.refresh(buyer)
+    db.add(Wallet(user_id=buyer.id, currency="AFN", balance=max(opening_balance, 0), wallet_status="active"))
+    db.commit()
+    return {"ok": True, "buyer_phone": buyer.phone_number}
+
+
+
 @app.get("/api/feed/sms")
 def feed_sms(db: Session = Depends(get_db)):
     rows = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(40).all()
-    return [{"id": s.id, "direction": s.direction, "body": s.body, "created_at": s.created_at.isoformat() if s.created_at else None} for s in rows]
+    return [{"id": s.id, "direction": s.direction, "from_number": s.from_number, "to_number": s.to_number, "body": s.body, "created_at": s.created_at.isoformat() if s.created_at else None} for s in rows]
 
 
 @app.get("/api/feed/transactions")
