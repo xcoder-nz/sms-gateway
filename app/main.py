@@ -1,12 +1,12 @@
 from decimal import Decimal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
@@ -52,6 +52,64 @@ def http_exception_handler(_: Request, exc: HTTPException):
     )
 
 
+def _to_decimal(amount: str | int | float | Decimal) -> Decimal:
+    try:
+        value = Decimal(str(amount)).quantize(Decimal("0.01"))
+    except Exception as exc:
+        raise HTTPException(400, "Invalid amount") from exc
+    if value <= Decimal("0.00"):
+        raise HTTPException(400, "Amount must be positive")
+    return value
+
+
+def _process_payment(
+    db: Session,
+    buyer: User,
+    merchant: User,
+    amount: Decimal,
+    idempotency_key: str | None = None,
+):
+    if idempotency_key:
+        existing = db.query(Transaction).filter(Transaction.idempotency_key == idempotency_key).first()
+        if existing:
+            return existing
+
+    with db.begin():
+        wallet_ids = sorted([buyer.id, merchant.id])
+        wallets = (
+            db.query(Wallet)
+            .filter(Wallet.user_id.in_(wallet_ids))
+            .with_for_update()
+            .all()
+        )
+        wallet_by_user = {w.user_id: w for w in wallets}
+        buyer_w = wallet_by_user.get(buyer.id)
+        merch_w = wallet_by_user.get(merchant.id)
+        if not buyer_w or not merch_w:
+            raise HTTPException(404, "Wallet not found")
+        if buyer_w.balance < amount:
+            raise HTTPException(400, "Insufficient balance")
+
+        buyer_w.balance -= amount
+        merch_w.balance += amount
+        tx = Transaction(
+            reference=str(uuid4())[:12],
+            type="payment",
+            from_user_id=buyer.id,
+            to_user_id=merchant.id,
+            merchant_id=merchant.id,
+            amount=amount,
+            currency="AFN",
+            status="completed",
+            idempotency_key=idempotency_key,
+        )
+        db.add(tx)
+
+    db.refresh(tx)
+    return tx
+
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "mode": "DEMO/SIMULATED"}
@@ -71,13 +129,40 @@ def admin(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 @app.post("/api/sms/inbound")
-def inbound(payload: InboundSMSRequest, db: Session = Depends(get_db)):
-    msg = adapter.normalize_inbound(payload.model_dump())
-    db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
-    db.commit()
+def inbound(payload: dict, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"), db: Session = Depends(get_db)):
+    msg = adapter.normalize_inbound(payload)
+    inbound_key = idempotency_key or payload.get("idempotency_key")
+    if inbound_key:
+        existing_sms = db.query(SMSMessage).filter(SMSMessage.idempotency_key == inbound_key).first()
+        if existing_sms:
+            return {"ok": True, "deduplicated": True}
+    try:
+        with db.begin():
+            db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received", idempotency_key=inbound_key))
+    except IntegrityError:
+        return {"ok": True, "deduplicated": True}
     cmd = parse_command(msg.body)
     log_event(db, "sms_command", cmd)
     return execute_command(msg.from_number, cmd, db)
+
+
+@app.post("/api/transactions/pay")
+def api_pay(payload: dict, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"), db: Session = Depends(get_db)):
+    payer_phone = payload.get("payer_phone")
+    merchant_phone = payload.get("merchant_phone")
+    pin = payload.get("pin")
+    amount = _to_decimal(payload.get("amount"))
+
+    payer = db.query(User).filter(User.phone_number == payer_phone, User.status == "active").first()
+    merchant = db.query(User).filter(User.phone_number == merchant_phone, User.role == "merchant", User.status == "active").first()
+    if not payer or not merchant:
+        raise HTTPException(404, "User not found")
+    if not pwd.verify(pin, payer.pin_hash):
+        raise HTTPException(400, "Invalid PIN")
+
+    operation_key = idempotency_key or payload.get("idempotency_key")
+    tx = _process_payment(db, payer, merchant, amount, operation_key)
+    return {"ok": True, "transaction_reference": tx.reference, "status": tx.status}
 
 
 
@@ -98,8 +183,9 @@ def execute_command(sender: str, cmd: dict, db: Session):
     if cmd["cmd"] == "BAL":
         w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         send_outbound(db, sender, f"DEMO BALANCE: {w.balance} {w.currency}")
-        tx = Transaction(reference=str(uuid4())[:12], type="balance_inquiry", from_user_id=user.id, amount=0, currency="AFN", status="completed")
-        db.add(tx); db.commit()
+        with db.begin():
+            tx = Transaction(reference=str(uuid4())[:12], type="balance_inquiry", from_user_id=user.id, amount=Decimal("0.00"), currency="AFN", status="completed")
+            db.add(tx)
         return {"ok": True}
     if cmd["cmd"] == "PAY":
         if not pwd.verify(cmd["pin"], user.pin_hash):
@@ -107,14 +193,8 @@ def execute_command(sender: str, cmd: dict, db: Session):
         merch = db.query(User).filter(User.phone_number == cmd["merchant_phone"], User.role == "merchant", User.status == "active").first()
         if not merch:
             raise HTTPException(404, "Merchant not found")
-        buyer_w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
-        merch_w = db.query(Wallet).filter(Wallet.user_id == merch.id).first()
-        amount = Decimal(cmd["amount"])
-        if amount <= 0 or buyer_w.balance < amount:
-            raise HTTPException(400, "Insufficient balance")
-        buyer_w.balance -= amount; merch_w.balance += amount
-        tx = Transaction(reference=str(uuid4())[:12], type="payment", from_user_id=user.id, to_user_id=merch.id, merchant_id=merch.id, amount=amount, currency="AFN", status="completed")
-        db.add(tx); db.commit(); db.refresh(tx)
+        amount = _to_decimal(cmd["amount"])
+        tx = _process_payment(db, user, merch, amount)
         send_outbound(db, sender, f"DEMO RECEIPT: Paid {amount} AFN to {merch.full_name}", tx.id)
         send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id)
         return {"ok": True, "transaction_reference": tx.reference}
