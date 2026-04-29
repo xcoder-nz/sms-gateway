@@ -17,123 +17,20 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
-from app.config import settings
-from app.db import Base, engine, get_db
+from app.db import get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import audit_command_decision, audit_state_change, log_event
 from app.services.command_parser import parse_command
+from app.config import settings
 
 app = FastAPI(title="SMS Wallet Demo")
 app.mount("/static", StaticFiles(directory="app/ui/static"), name="static")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
-logger = logging.getLogger("sms_gateway")
-admin_auth_scheme = HTTPBearer(auto_error=False)
-inbound_rate_limit_windows = defaultdict(deque)
-pin_attempts = defaultdict(lambda: {"count": 0, "lockout_until": None})
-Base.metadata.create_all(bind=engine)
-logger = logging.getLogger("sms_gateway")
-
-
-@app.middleware("http")
-async def correlation_middleware(request: Request, call_next):
-    correlation_id = request.headers.get("x-correlation-id") or str(uuid4())
-    request.state.correlation_id = correlation_id
-    response = await call_next(request)
-    response.headers["x-correlation-id"] = correlation_id
-    return response
-
-app.include_router(health_router)
-app.include_router(sms_router)
-app.include_router(users_router)
-app.include_router(wallets_router)
-app.include_router(transactions_router)
-app.include_router(merchants_router)
-app.include_router(network_router)
-
-def _digits_only(value: str) -> str:
-    return "".join(ch for ch in value if ch.isdigit())
-
-
-@app.exception_handler(RequestValidationError)
-def request_validation_handler(_: Request, exc: RequestValidationError):
-    details = [ErrorDetail(field=".".join(str(p) for p in e["loc"][1:]), message=e["msg"]).model_dump() for e in exc.errors()]
-    return JSONResponse(
-        status_code=422,
-        content={"ok": False, "error_code": "validation_failed", "message": "Request payload validation failed", "details": details},
-    )
-
-
-@app.exception_handler(HTTPException)
-def http_exception_handler(_: Request, exc: HTTPException):
-    code = "business_rule_rejected" if exc.status_code in (400, 404, 409) else "http_error"
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"ok": False, "error_code": code, "message": str(exc.detail), "details": []},
-    )
-
-
-def _to_decimal(amount: str | int | float | Decimal) -> Decimal:
-    try:
-        value = Decimal(str(amount)).quantize(Decimal("0.01"))
-    except Exception as exc:
-        raise HTTPException(400, "Invalid amount") from exc
-    if value <= Decimal("0.00"):
-        raise HTTPException(400, "Amount must be positive")
-    return value
-
-
-def _process_payment(
-    db: Session,
-    buyer: User,
-    merchant: User,
-    amount: Decimal,
-    idempotency_key: str | None = None,
-):
-    if idempotency_key:
-        existing = db.query(Transaction).filter(Transaction.idempotency_key == idempotency_key).first()
-        if existing:
-            return existing
-
-    with db.begin():
-        wallet_ids = sorted([buyer.id, merchant.id])
-        wallets = (
-            db.query(Wallet)
-            .filter(Wallet.user_id.in_(wallet_ids))
-            .with_for_update()
-            .all()
-        )
-        wallet_by_user = {w.user_id: w for w in wallets}
-        buyer_w = wallet_by_user.get(buyer.id)
-        merch_w = wallet_by_user.get(merchant.id)
-        if not buyer_w or not merch_w:
-            raise HTTPException(404, "Wallet not found")
-        if buyer_w.balance < amount:
-            raise HTTPException(400, "Insufficient balance")
-
-        buyer_w.balance -= amount
-        merch_w.balance += amount
-        tx = Transaction(
-            reference=str(uuid4())[:12],
-            type="payment",
-            from_user_id=buyer.id,
-            to_user_id=merchant.id,
-            merchant_id=merchant.id,
-            amount=amount,
-            currency="AFN",
-            status="completed",
-            idempotency_key=idempotency_key,
-        )
-        db.add(tx)
-
-    db.refresh(tx)
-    return tx
-
-
 
 @app.get("/health")
 def health():
-    return {"ok": True, "mode": "DEMO/SIMULATED"}
+    return {"ok": True, "mode": settings.app_env, "adapter": settings.sms_adapter}
 
 
 @app.get("/", response_class=HTMLResponse)
