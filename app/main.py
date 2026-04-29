@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -27,6 +28,28 @@ app = FastAPI(title="SMS Wallet Demo")
 app.mount("/static", StaticFiles(directory="app/ui/static"), name="static")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
+logger = logging.getLogger(__name__)
+pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_failed_pin_attempts: dict[str, deque[datetime]] = defaultdict(deque)
+
+
+def enforce_pin_lockout(sender: str):
+    now = datetime.now(timezone.utc)
+    window = now - timedelta(minutes=5)
+    attempts = _failed_pin_attempts[sender]
+    while attempts and attempts[0] < window:
+        attempts.popleft()
+    if len(attempts) >= 5:
+        raise HTTPException(429, "Too many PIN attempts")
+
+
+
+
+def require_admin():
+    # Demo placeholder until real auth is wired in
+    return None
+
+
 
 @app.get("/health")
 def health():
@@ -64,7 +87,7 @@ def feed_transactions(db: Session = Depends(get_db)):
 @app.post("/api/sms/inbound")
 def inbound(payload: dict, request: Request, db: Session = Depends(get_db)):
     request_id = request.headers.get("x-request-id") or str(uuid4())
-    correlation_id = request.state.correlation_id
+    correlation_id = getattr(request.state, "correlation_id", str(uuid4()))
     msg = adapter.normalize_inbound(payload)
     db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
     db.commit()
@@ -79,13 +102,13 @@ def inbound(payload: dict, request: Request, db: Session = Depends(get_db)):
             actor=msg.from_number,
             correlation_id=correlation_id,
             request_id=request_id,
-            sms_provider_message_id=msg.provider_message_id,
+            sms_provider_message_id=getattr(msg, "provider_message_id", None),
         )
         raise HTTPException(400, "Invalid command")
 
     log_event(db, "sms_command", cmd)
     logger.info(json.dumps({"event": "inbound_sms", "correlation_id": correlation_id, "request_id": request_id, "actor": msg.from_number, "command": cmd["cmd"]}))
-    return execute_command(msg.from_number, cmd, db, correlation_id=correlation_id, request_id=request_id, sms_ref=msg.provider_message_id)
+    return execute_command(msg.from_number, cmd, db, correlation_id=correlation_id, request_id=request_id, sms_ref=getattr(msg, "provider_message_id", None))
 
 
 
@@ -145,8 +168,10 @@ def execute_command(sender: str, cmd: dict, db: Session, correlation_id: str | N
     if cmd["cmd"] == "PAY":
         enforce_pin_lockout(sender)
         if not pwd.verify(cmd["pin"], user.pin_hash):
+            _failed_pin_attempts[sender].append(datetime.now(timezone.utc))
             audit_command_decision(db, command="PAY", status="rejected", reason_code="INVALID_PIN", actor=sender, target=cmd["merchant_phone"], amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
             raise HTTPException(400, "Invalid PIN")
+        _failed_pin_attempts.pop(sender, None)
         merch = db.query(User).filter(User.phone_number == cmd["merchant_phone"], User.role == "merchant", User.status == "active").first()
         if not merch:
             audit_command_decision(db, command="PAY", status="rejected", reason_code="MERCHANT_NOT_FOUND", actor=sender, target=cmd["merchant_phone"], amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
