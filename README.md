@@ -1,16 +1,14 @@
 # SMS Wallet Demo (DEMO / SIMULATED)
 
-Local-first, provider-agnostic SMS wallet demo using FastAPI + SQLite.
+Local-first, provider-agnostic SMS wallet demo using FastAPI with Alembic-managed schema migrations.
 
-> All balances and money movement are simulated in-app (demo ledger only).
-
-## 1) Run locally
+## Quick start (local dev)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .[test]
 cp .env.example .env
-python -c "from app.main import app"  # initialize db tables
+alembic upgrade head
 python app/seed/demo_seed.py
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -18,27 +16,92 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Open:
 - Mobile demo: http://127.0.0.1:8000/
 - Admin dashboard: http://127.0.0.1:8000/admin
+- Health check: http://127.0.0.1:8000/health
 
-## 2) Run in a shared cloud environment
+## Schema evolution (Alembic)
 
-The app can run on any VM/container service (Railway/Render/Fly.io/ECS/Kubernetes/etc.) as long as you can expose HTTP endpoints.
+Use migrations instead of implicit table creation:
 
-### Minimal cloud checklist
-1. Build/deploy this repo as a Python web service.
-2. Set environment variables from `.env.example`.
-3. Start command:
-   - `uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}`
-4. Run seed once after first boot:
-   - `python app/seed/demo_seed.py`
-5. Persist your SQLite file or switch to Postgres for multi-instance/shared deployments.
+```bash
+alembic upgrade head      # apply latest schema
+alembic downgrade -1      # roll back one migration
+alembic downgrade base    # clear schema
+```
 
-### Important cloud note
-- SQLite is okay for single-instance demos.
-- For shared team environments or autoscaling, move to Postgres and set `DATABASE_URL` accordingly.
+## Environment profiles + startup behavior
 
-## 3) Demo SMS commands
+Profiles are stored in `.env.dev`, `.env.demo`, `.env.prod`:
 
-### Simulated inbound (works everywhere)
+- `dev`: sqlite + reload/debug + mock adapters
+- `demo`: postgres + no reload + mock SMS
+- `prod`: postgres + no reload + android SMS adapter
+
+Run with profile:
+
+```bash
+./scripts/start.sh dev
+./scripts/start.sh demo
+./scripts/start.sh prod
+```
+
+The start script loads the profile env file, runs `alembic upgrade head`, then starts Uvicorn.
+
+## Docker / Compose (prod-like local)
+
+Build app image:
+
+```bash
+docker build -t sms-gateway .
+```
+
+Run app + Postgres locally:
+
+```bash
+docker compose up --build
+```
+
+This uses `.env.demo` for the app container and a Postgres 16 service.
+
+## Shared cloud deployment runbook
+
+### 1) Provision
+- Deploy app container/image using `Dockerfile`.
+- Provision managed Postgres.
+- Set env vars (from `.env.prod` baseline) with secure credentials.
+
+### 2) Bootstrap
+```bash
+alembic upgrade head
+python app/seed/demo_seed.py
+```
+
+### 3) Runtime command
+```bash
+./scripts/start.sh prod
+```
+
+### 4) Health checks
+- Liveness/readiness endpoint: `GET /health`
+- Expected payload includes `ok`, active profile (`mode`), and selected adapter.
+
+### 5) Ops commands
+Seed data:
+```bash
+./scripts/seed.sh
+```
+
+Reset schema + reseed:
+```bash
+./scripts/reset_db.sh
+```
+
+### 6) Notes for shared environments
+- Prefer Postgres for multi-user/shared deployments.
+- Run migrations on deploy before switching traffic.
+- Keep seed/reset scripts restricted to non-production or controlled maintenance windows.
+
+## Demo SMS commands
+
 ```bash
 curl -X POST http://127.0.0.1:8000/api/sms/inbound \
   -H 'content-type: application/json' \
@@ -49,27 +112,7 @@ curl -X POST http://127.0.0.1:8000/api/sms/inbound \
   -d '{"from_number":"0700123456","body":"PAY 0799001100 120 PIN 1234"}'
 ```
 
-## 4) Can this interact with real phones/SMS?
-
-### Current state in this repo
-- **Inbound from real SMS networks is not turnkey yet.**
-- The current backend endpoint `/api/sms/inbound` works and processes canonical payloads.
-- `AndroidGatewayAdapter` exists for outbound + payload normalization, but there is no fully wired adapter factory/router yet to switch transports dynamically at runtime.
-
-### iPhone question (direct answer)
-- **You cannot use an iPhone as the SMS gateway host for this code path today.**
-- Typical “Android SMS gateway” apps run on Android devices and expose an HTTP webhook/API that this app can call.
-- You *can* send an SMS from your iPhone **to the Android phone number** (running gateway app), and if that gateway forwards inbound SMS to `/api/sms/inbound`, then this backend can process it.
-
-### Practical demo setup with real phones
-1. Run this backend on a public HTTPS URL.
-2. Run an Android SMS gateway app on an Android phone with a SIM.
-3. Configure the gateway inbound webhook to `POST https://<your-domain>/api/sms/inbound`.
-4. Configure outbound API credentials in `.env` (`ANDROID_GATEWAY_URL`, `ANDROID_GATEWAY_TOKEN`).
-5. Send SMS from any phone (including iPhone) to the Android gateway SIM number.
-6. Watch `/admin` and `/` pages update with SMS logs/transactions.
-
-## 5) Testing
+## Testing
 
 ```bash
 pytest -q

@@ -9,21 +9,20 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.adapters.sms.mock import MockSMSAdapter
-from app.db import Base, engine, get_db
+from app.db import get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import log_event
 from app.services.command_parser import parse_command
+from app.config import settings
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
-Base.metadata.create_all(bind=engine)
-
 
 @app.get("/health")
 def health():
-    return {"ok": True, "mode": "DEMO/SIMULATED"}
+    return {"ok": True, "mode": settings.app_env, "adapter": settings.sms_adapter}
 
 @app.get("/", response_class=HTMLResponse)
 def mobile_demo(request: Request, db: Session = Depends(get_db)):

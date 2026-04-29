@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.demo
+    depends_on:
+      - postgres
+    command: ["./scripts/start.sh", "demo"]
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sms_gateway
+      POSTGRES_USER: sms
+      POSTGRES_PASSWORD: sms
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  pg_data:
