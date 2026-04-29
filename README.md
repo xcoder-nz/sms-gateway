@@ -44,7 +44,7 @@ Run with profile:
 ./scripts/start.sh prod
 ```
 
-The start script loads the profile env file, runs `alembic upgrade head`, then starts Uvicorn.
+The start script validates the profile, loads the matching env file when present, runs `alembic upgrade head`, then starts Uvicorn. For hosted `prod` deployments (e.g., Render), it can run without `.env.prod` as long as required environment variables are set in the platform config.
 
 ## Docker / Compose (prod-like local)
 
