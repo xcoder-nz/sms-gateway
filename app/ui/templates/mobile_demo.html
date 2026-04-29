@@ -1,0 +1,1 @@
+<!doctype html><html><body><h1>DEMO/SIMULATED Mobile SMS Wallet</h1><p>Use POST /api/sms/inbound to simulate inbound SMS.</p><ul>{% for s in sms %}<li>{{s.direction}} {{s.from_number}} -> {{s.to_number}}: {{s.body}}</li>{% endfor %}</ul></body></html>
