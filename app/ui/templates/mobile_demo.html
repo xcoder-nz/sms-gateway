@@ -1,1 +1,38 @@
-<!doctype html><html><body><h1>DEMO/SIMULATED Mobile SMS Wallet</h1><p>Use POST /api/sms/inbound to simulate inbound SMS.</p><ul>{% for s in sms %}<li>{{s.direction}} {{s.from_number}} -> {{s.to_number}}: {{s.body}}</li>{% endfor %}</ul></body></html>
+<!doctype html>
+<html>
+<head>
+  <title>Mobile Demo</title>
+  <link rel="stylesheet" href="/static/demo.css" />
+</head>
+<body>
+<div class="container">
+  <h1>Mobile SMS Wallet <span class="badge demo">DEMO</span> <span class="badge sim">SIMULATED</span></h1>
+  <div class="grid">
+    <section class="card">
+      <h3>Mobile Demo Controls</h3>
+      <label>Buyer Selector <span class="badge demo">DEMO</span></label>
+      <select id="buyer">
+        {% for u in users %}<option value="{{u.phone_number}}">{{u.full_name}} ({{u.phone_number}})</option>{% endfor %}
+      </select>
+      <label style="margin-top:8px">Command Builder <span class="badge sim">SIMULATED</span></label>
+      <input id="command" value="BAL" />
+      <div style="display:flex; gap:8px; margin-top:10px;">
+        <button id="send-command">Send Action</button>
+        <button class="secondary" onclick="document.getElementById('command').value='PAY +93700000002 25 PIN 1234'">Build PAY</button>
+      </div>
+      <p class="small">All sends are DEMO/SIMULATED and routed to mock services.</p>
+    </section>
+
+    <section class="card">
+      <h3>Message History <span class="badge demo">DEMO</span></h3>
+      <div class="history">
+        <table><thead><tr><th>ID</th><th>Dir</th><th>Body</th><th>Time</th></tr></thead>
+          <tbody id="sms-history"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="/static/demo.js"></script>
+</body>
+</html>

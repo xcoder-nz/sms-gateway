@@ -16,4 +16,5 @@ class Transaction(Base):
     currency = Column(String, default="AFN", nullable=False)
     status = Column(String, nullable=False)
     rejection_reason = Column(String, nullable=True)
+    idempotency_key = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
