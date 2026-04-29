@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
-from app.db import SessionLocal, get_db
+from app.db import SessionLocal, ensure_sqlite_schema_compatibility, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
 from app.services.audit_service import audit_command_decision, audit_state_change, log_event
 from app.services.command_parser import parse_command
@@ -54,6 +54,7 @@ def require_admin():
 
 @app.on_event("startup")
 def seed_demo_users_on_startup():
+    ensure_sqlite_schema_compatibility()
     db = SessionLocal()
     try:
         seed_for_session(db)
