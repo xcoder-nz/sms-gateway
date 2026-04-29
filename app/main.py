@@ -60,7 +60,7 @@ def health():
 def mobile_demo(request: Request, db: Session = Depends(get_db)):
     users = db.query(User).filter(User.role == "buyer").all()
     sms = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(25).all()
-    return templates.TemplateResponse("mobile_demo.html", {"request": request, "users": users, "sms": sms})
+    return templates.TemplateResponse(request=request, name="mobile_demo.html", context={"request": request, "users": users, "sms": sms})
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -69,7 +69,7 @@ def admin(request: Request, db: Session = Depends(get_db), _: User = Depends(req
     txns = db.query(Transaction).order_by(Transaction.id.desc()).limit(20).all()
     wallets = db.query(Wallet).all()
     sms = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(20).all()
-    return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
+    return templates.TemplateResponse(request=request, name="admin.html", context={"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 
 
