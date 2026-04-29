@@ -2,15 +2,19 @@ from decimal import Decimal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from passlib.context import CryptContext
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
 from app.db import Base, engine, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
+from app.schemas.api_responses import ErrorDetail
+from app.schemas.sms import InboundSMSRequest
 from app.services.audit_service import log_event
 from app.services.command_parser import parse_command
 
@@ -19,6 +23,28 @@ app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
+
+
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+@app.exception_handler(RequestValidationError)
+def request_validation_handler(_: Request, exc: RequestValidationError):
+    details = [ErrorDetail(field=".".join(str(p) for p in e["loc"][1:]), message=e["msg"]).model_dump() for e in exc.errors()]
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "error_code": "validation_failed", "message": "Request payload validation failed", "details": details},
+    )
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(_: Request, exc: HTTPException):
+    code = "business_rule_rejected" if exc.status_code in (400, 404, 409) else "http_error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"ok": False, "error_code": code, "message": str(exc.detail), "details": []},
+    )
 
 
 @app.get("/health")
@@ -40,8 +66,8 @@ def admin(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
 @app.post("/api/sms/inbound")
-def inbound(payload: dict, db: Session = Depends(get_db)):
-    msg = adapter.normalize_inbound(payload)
+def inbound(payload: InboundSMSRequest, db: Session = Depends(get_db)):
+    msg = adapter.normalize_inbound(payload.model_dump())
     db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
     db.commit()
     cmd = parse_command(msg.body)
@@ -60,7 +86,8 @@ def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id:
 
 
 def execute_command(sender: str, cmd: dict, db: Session):
-    user = db.query(User).filter(User.phone_number == sender).first()
+    sender_digits = _digits_only(sender)
+    user = next((candidate for candidate in db.query(User).all() if _digits_only(candidate.phone_number) == sender_digits), None)
     if cmd["cmd"] == "HELP":
         send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>")
         return {"ok": True}
