@@ -1,3 +1,5 @@
+import json
+import logging
 from decimal import Decimal
 from uuid import uuid4
 
@@ -11,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.adapters.sms.mock import MockSMSAdapter
 from app.db import Base, engine, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
-from app.services.audit_service import log_event
+from app.services.audit_service import audit_command_decision, audit_state_change, log_event
 from app.services.command_parser import parse_command
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -19,17 +21,29 @@ app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
 adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
+logger = logging.getLogger("sms_gateway")
+
+
+@app.middleware("http")
+async def correlation_middleware(request: Request, call_next):
+    correlation_id = request.headers.get("x-correlation-id") or str(uuid4())
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["x-correlation-id"] = correlation_id
+    return response
 
 
 @app.get("/health")
 def health():
     return {"ok": True, "mode": "DEMO/SIMULATED"}
 
+
 @app.get("/", response_class=HTMLResponse)
 def mobile_demo(request: Request, db: Session = Depends(get_db)):
     users = db.query(User).filter(User.role == "buyer").all()
     sms = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(25).all()
     return templates.TemplateResponse("mobile_demo.html", {"request": request, "users": users, "sms": sms})
+
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin(request: Request, db: Session = Depends(get_db)):
@@ -39,18 +53,49 @@ def admin(request: Request, db: Session = Depends(get_db)):
     sms = db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(20).all()
     return templates.TemplateResponse("admin.html", {"request": request, "total_float": total_float, "txns": txns, "wallets": wallets, "sms": sms})
 
+
 @app.post("/api/sms/inbound")
-def inbound(payload: dict, db: Session = Depends(get_db)):
+def inbound(payload: dict, request: Request, db: Session = Depends(get_db)):
+    request_id = request.headers.get("x-request-id") or str(uuid4())
+    correlation_id = request.state.correlation_id
     msg = adapter.normalize_inbound(payload)
     db.add(SMSMessage(direction="inbound", from_number=msg.from_number, to_number=msg.to_number, body=msg.body, delivery_status="received"))
     db.commit()
-    cmd = parse_command(msg.body)
+    try:
+        cmd = parse_command(msg.body)
+    except ValueError:
+        audit_command_decision(
+            db,
+            command="UNKNOWN",
+            status="rejected",
+            reason_code="INVALID_COMMAND",
+            actor=msg.from_number,
+            correlation_id=correlation_id,
+            request_id=request_id,
+            sms_provider_message_id=msg.provider_message_id,
+        )
+        raise HTTPException(400, "Invalid command")
+
     log_event(db, "sms_command", cmd)
-    return execute_command(msg.from_number, cmd, db)
+    logger.info(json.dumps({"event": "inbound_sms", "correlation_id": correlation_id, "request_id": request_id, "actor": msg.from_number, "command": cmd["cmd"]}))
+    return execute_command(msg.from_number, cmd, db, correlation_id=correlation_id, request_id=request_id, sms_ref=msg.provider_message_id)
+
 
 @app.get("/api/sms/logs")
 def sms_logs(db: Session = Depends(get_db)):
     return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
+
+
+@app.get("/api/network/summary")
+def network_summary(db: Session = Depends(get_db)):
+    inbound_sms_count = db.query(SMSMessage).filter(SMSMessage.direction == "inbound").count()
+    failed_commands = db.query(Transaction).filter(Transaction.status == "rejected").count()
+    completed_payments = db.query(Transaction).filter(Transaction.type == "payment", Transaction.status == "completed").count()
+    return {
+        "inbound_sms_count": inbound_sms_count,
+        "failed_commands": failed_commands,
+        "completed_payments": completed_payments,
+    }
 
 
 def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id: int | None = None):
@@ -59,34 +104,52 @@ def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id:
     db.commit()
 
 
-def execute_command(sender: str, cmd: dict, db: Session):
+def execute_command(sender: str, cmd: dict, db: Session, correlation_id: str | None = None, request_id: str | None = None, sms_ref: str | None = None):
     user = db.query(User).filter(User.phone_number == sender).first()
     if cmd["cmd"] == "HELP":
+        audit_command_decision(db, command="HELP", status="accepted", reason_code="HELP_REQUESTED", actor=sender, correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
         send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>")
         return {"ok": True}
     if not user or user.status != "active":
+        audit_command_decision(db, command=cmd["cmd"], status="rejected", reason_code="SENDER_NOT_ACTIVE", actor=sender, correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
+        tx = Transaction(reference=str(uuid4())[:12], type=cmd["cmd"].lower(), from_user_id=None, amount=0, currency="AFN", status="rejected", rejection_reason="SENDER_NOT_ACTIVE")
+        db.add(tx); db.commit()
         raise HTTPException(404, "Sender not active")
     if cmd["cmd"] == "BAL":
         w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         send_outbound(db, sender, f"DEMO BALANCE: {w.balance} {w.currency}")
         tx = Transaction(reference=str(uuid4())[:12], type="balance_inquiry", from_user_id=user.id, amount=0, currency="AFN", status="completed")
         db.add(tx); db.commit()
+        audit_command_decision(db, command="BAL", status="accepted", reason_code="BALANCE_REQUESTED", actor=sender, amount=0, transaction_reference=tx.reference, correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
+        audit_state_change(db, state_change="BALANCE_INQUIRY_COMPLETED", actor=sender, amount=0, transaction_reference=tx.reference, correlation_id=correlation_id, request_id=request_id)
         return {"ok": True}
     if cmd["cmd"] == "PAY":
         if not pwd.verify(cmd["pin"], user.pin_hash):
+            audit_command_decision(db, command="PAY", status="rejected", reason_code="INVALID_PIN", actor=sender, target=cmd["merchant_phone"], amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
             raise HTTPException(400, "Invalid PIN")
         merch = db.query(User).filter(User.phone_number == cmd["merchant_phone"], User.role == "merchant", User.status == "active").first()
         if not merch:
+            audit_command_decision(db, command="PAY", status="rejected", reason_code="MERCHANT_NOT_FOUND", actor=sender, target=cmd["merchant_phone"], amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
             raise HTTPException(404, "Merchant not found")
         buyer_w = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         merch_w = db.query(Wallet).filter(Wallet.user_id == merch.id).first()
         amount = Decimal(cmd["amount"])
-        if amount <= 0 or buyer_w.balance < amount:
+        if amount <= 0:
+            audit_command_decision(db, command="PAY", status="rejected", reason_code="INVALID_AMOUNT", actor=sender, target=merch.phone_number, amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
+            raise HTTPException(400, "Invalid amount")
+        if buyer_w.balance < amount:
+            audit_command_decision(db, command="PAY", status="rejected", reason_code="INSUFFICIENT_BALANCE", actor=sender, target=merch.phone_number, amount=cmd["amount"], correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
+            tx = Transaction(reference=str(uuid4())[:12], type="payment", from_user_id=user.id, to_user_id=merch.id, merchant_id=merch.id, amount=amount, currency="AFN", status="rejected", rejection_reason="INSUFFICIENT_BALANCE")
+            db.add(tx); db.commit()
             raise HTTPException(400, "Insufficient balance")
         buyer_w.balance -= amount; merch_w.balance += amount
         tx = Transaction(reference=str(uuid4())[:12], type="payment", from_user_id=user.id, to_user_id=merch.id, merchant_id=merch.id, amount=amount, currency="AFN", status="completed")
         db.add(tx); db.commit(); db.refresh(tx)
         send_outbound(db, sender, f"DEMO RECEIPT: Paid {amount} AFN to {merch.full_name}", tx.id)
         send_outbound(db, merch.phone_number, f"DEMO RECEIPT: Received {amount} AFN from {user.full_name}", tx.id)
+        audit_command_decision(db, command="PAY", status="accepted", reason_code="PAYMENT_COMPLETED", actor=sender, target=merch.phone_number, amount=amount, transaction_reference=tx.reference, correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
+        audit_state_change(db, state_change="PAYMENT_COMPLETED", actor=sender, target=merch.phone_number, amount=amount, transaction_reference=tx.reference, correlation_id=correlation_id, request_id=request_id)
+        logger.info(json.dumps({"event": "payment_completed", "correlation_id": correlation_id, "request_id": request_id, "sms_provider_message_id": sms_ref, "transaction_reference": tx.reference, "amount": str(amount), "actor": sender, "target": merch.phone_number}))
         return {"ok": True, "transaction_reference": tx.reference}
+    audit_command_decision(db, command=cmd["cmd"], status="rejected", reason_code="UNSUPPORTED_COMMAND", actor=sender, correlation_id=correlation_id, request_id=request_id, sms_provider_message_id=sms_ref)
     return {"ok": True, "note": "Command accepted"}
