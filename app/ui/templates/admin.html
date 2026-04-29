@@ -17,12 +17,19 @@
     </section>
 
     <section class="card">
-      <h3>Payment Network Visualization <span class="badge sim">SIMULATED</span></h3>
-      <div class="route">
-        <span class="node" id="route-buyer">Buyer</span><span class="edge">→</span>
-        <span class="node" id="route-demo-switch">DemoSwitch (latest route highlight)</span><span class="edge">→</span>
-        <span class="node" id="route-merchant">Merchant</span>
-      </div>
+      <h3>Add Buyer (No Auth)</h3>
+      <form id="create-buyer-form" class="stack">
+        <label>Full name</label>
+        <input name="full_name" required placeholder="Buyer Two" />
+        <label>Phone number</label>
+        <input name="phone_number" required placeholder="0700999000" />
+        <label>PIN</label>
+        <input name="pin" value="1234" required />
+        <label>Opening balance (AFN)</label>
+        <input name="opening_balance" type="number" min="0" value="500" required />
+        <button type="submit">Create Buyer</button>
+      </form>
+      <div id="buyer-create-status" class="small"></div>
     </section>
   </div>
 
@@ -42,5 +49,24 @@
   </div>
 </div>
 <script src="/static/demo.js"></script>
+<script>
+const form = document.getElementById("create-buyer-form");
+if (form) {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload = Object.fromEntries(new FormData(form).entries());
+    payload.opening_balance = Number(payload.opening_balance || 0);
+    const status = document.getElementById("buyer-create-status");
+    try {
+      const r = await fetch("/admin/buyers", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+      if (!r.ok) throw new Error(await r.text());
+      status.textContent = "Buyer created. Refreshing...";
+      setTimeout(()=>window.location.reload(), 400);
+    } catch (err) {
+      status.textContent = "Failed: " + err.message;
+    }
+  });
+}
+</script>
 </body>
 </html>

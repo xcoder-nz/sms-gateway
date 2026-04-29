@@ -11,7 +11,16 @@ input,select,button{width:100%;padding:8px;border-radius:8px;border:1px solid #3
 button{background:#2563eb;border:none;font-weight:600;cursor:pointer}
 button.secondary{background:#374151}
 table{width:100%;border-collapse:collapse} th,td{padding:8px;border-bottom:1px solid #1f2937;font-size:13px;text-align:left}
-.history{max-height:260px;overflow:auto}
 .route{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.node{padding:6px 10px;border-radius:999px;background:#1f2937}.edge{color:var(--muted)}
 .highlight{outline:2px solid var(--accent);box-shadow:0 0 0 3px rgba(34,197,94,.2)}
 .small{font-size:12px;color:var(--muted)}
+
+.phones{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:16px;margin-top:16px}
+.phone{background:var(--panel);border:1px solid #1f2937;border-radius:22px;padding:12px;min-height:360px}
+.phone h4{margin:0 0 10px 0}
+.chat{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow:auto;padding-right:4px}
+.bubble{padding:8px 10px;border-radius:12px;font-size:13px;max-width:90%}
+.bubble.in{align-self:flex-start;background:#1f2937}
+.bubble.out{align-self:flex-end;background:#0b5ed7}
+.stack{display:flex;flex-direction:column;gap:8px}
+@media (max-width: 900px){.phones{grid-template-columns:1fr}}

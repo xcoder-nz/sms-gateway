@@ -6,6 +6,19 @@ async function postJson(url, payload){
 
 function fmtTime(s){ return s ? new Date(s).toLocaleTimeString() : ''; }
 
+function renderPhones(sms){
+  const buyerPhone = document.getElementById('buyer')?.value;
+  const buyerEl = document.getElementById('buyer-chat');
+  const merchantEl = document.getElementById('merchant-chat');
+  if(!buyerEl || !merchantEl || !buyerPhone) return;
+
+  const buyerMsgs = sms.filter(s => s.from_number === buyerPhone || s.to_number === buyerPhone);
+  buyerEl.innerHTML = buyerMsgs.map(s => `<div class="bubble ${s.direction === 'inbound' ? 'out' : 'in'}">${s.body}<br><span class="small">${fmtTime(s.created_at)}</span></div>`).join('');
+
+  const merchMsgs = sms.filter(s => s.from_number === '0799001100' || s.to_number === '0799001100');
+  merchantEl.innerHTML = merchMsgs.map(s => `<div class="bubble ${s.direction === 'inbound' ? 'out' : 'in'}">${s.body}<br><span class="small">${fmtTime(s.created_at)}</span></div>`).join('');
+}
+
 async function refreshFeeds(){
   const [smsR, txR] = await Promise.all([fetch('/api/feed/sms'), fetch('/api/feed/transactions')]);
   const sms = await smsR.json(); const txs = await txR.json();
@@ -13,11 +26,7 @@ async function refreshFeeds(){
   if(smsEl){ smsEl.innerHTML = sms.map(s=>`<tr><td>${s.id}</td><td>${s.direction}</td><td>${s.body}</td><td>${fmtTime(s.created_at)}</td></tr>`).join(''); }
   const txEl = document.getElementById('txn-rows');
   if(txEl){ txEl.innerHTML = txs.map(t=>`<tr><td>${t.reference}</td><td>${t.type}</td><td>${t.amount} ${t.currency}</td><td><span class="badge sim">${t.status}</span></td><td>${fmtTime(t.created_at)}</td></tr>`).join(''); }
-  const latest = txs[0];
-  const detail = document.getElementById('txn-detail');
-  if(detail && latest){ detail.innerHTML = `<b>DEMO/SIMULATED</b> latest ref ${latest.reference}<br/>Route: Buyer → DemoSwitch → Merchant (${latest.type})`; }
-  document.querySelectorAll('.node').forEach(n=>n.classList.remove('highlight'));
-  const marker = document.getElementById('route-demo-switch'); if(marker) marker.classList.add('highlight');
+  renderPhones(sms);
 }
 
 function initMobile(){
@@ -30,6 +39,7 @@ function initMobile(){
     try { await postJson('/api/sms/inbound', payload); await refreshFeeds(); }
     catch(e){ alert('DEMO/SIMULATED error: '+e.message); }
   };
+  document.getElementById('buyer').addEventListener('change', ()=>refreshFeeds().catch(()=>{}));
 }
 
 setInterval(()=>refreshFeeds().catch(()=>{}), 3000);
