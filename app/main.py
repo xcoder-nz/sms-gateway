@@ -8,18 +8,48 @@ from passlib.context import CryptContext
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from app.adapters.sms.mock import MockSMSAdapter
 from app.db import Base, engine, get_db
 from app.models import MerchantProfile, SMSMessage, Transaction, User, Wallet
+from app.schemas.api_responses import ErrorDetail
+from app.schemas.sms import InboundSMSRequest
 from app.services.audit_service import log_event
 from app.services.command_parser import parse_command
 
-pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="SMS Wallet Demo")
 templates = Jinja2Templates(directory="app/ui/templates")
-adapter = MockSMSAdapter()
 Base.metadata.create_all(bind=engine)
+
+app.include_router(health_router)
+app.include_router(sms_router)
+app.include_router(users_router)
+app.include_router(wallets_router)
+app.include_router(transactions_router)
+app.include_router(merchants_router)
+app.include_router(network_router)
+
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+@app.exception_handler(RequestValidationError)
+def request_validation_handler(_: Request, exc: RequestValidationError):
+    details = [ErrorDetail(field=".".join(str(p) for p in e["loc"][1:]), message=e["msg"]).model_dump() for e in exc.errors()]
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "error_code": "validation_failed", "message": "Request payload validation failed", "details": details},
+    )
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(_: Request, exc: HTTPException):
+    code = "business_rule_rejected" if exc.status_code in (400, 404, 409) else "http_error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"ok": False, "error_code": code, "message": str(exc.detail), "details": []},
+    )
 
 
 def _to_decimal(amount: str | int | float | Decimal) -> Decimal:
@@ -115,9 +145,6 @@ def inbound(payload: dict, idempotency_key: str | None = Header(default=None, al
     log_event(db, "sms_command", cmd)
     return execute_command(msg.from_number, cmd, db)
 
-@app.get("/api/sms/logs")
-def sms_logs(db: Session = Depends(get_db)):
-    return db.query(SMSMessage).order_by(SMSMessage.id.desc()).limit(100).all()
 
 @app.post("/api/transactions/pay")
 def api_pay(payload: dict, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"), db: Session = Depends(get_db)):
@@ -146,7 +173,8 @@ def send_outbound(db: Session, to_number: str, body: str, linked_transaction_id:
 
 
 def execute_command(sender: str, cmd: dict, db: Session):
-    user = db.query(User).filter(User.phone_number == sender).first()
+    sender_digits = _digits_only(sender)
+    user = next((candidate for candidate in db.query(User).all() if _digits_only(candidate.phone_number) == sender_digits), None)
     if cmd["cmd"] == "HELP":
         send_outbound(db, sender, "DEMO HELP: BAL | PAY <merchant_phone> <amount> PIN <pin> | CASHIN <buyer_phone> <amount>")
         return {"ok": True}
